@@ -53,6 +53,16 @@ class SpecTests(unittest.TestCase):
             with self.subTest(message), self.assertRaisesRegex(ValueError, message):
                 spec.parse(variant(change))
 
+    def test_order_rejects_unplaceable_programmatic_graphs(self):
+        cases = (
+            ({"first": spec.Node("first", "agent", depends=("second",)),
+              "second": spec.Node("second", "agent", after=("first",))}, "cycle through"),
+            ({"first": spec.Node("first", "agent", depends=("missing",))}, "missing"),
+        )
+        for nodes, message in cases:
+            with self.subTest(nodes=nodes), self.assertRaisesRegex(ValueError, message):
+                spec.Graph("invalid", nodes).order()
+
     def test_refuses_more_than_the_node_limit(self):
         value = {"version": 1, "id": "wide",
                  "nodes": [{"id": f"n{index}", "kind": "agent"} for index in range(33)]}

@@ -64,10 +64,19 @@ class Graph:
         """Node ids with every dependency and ``after`` node before the node itself."""
         placed, ordered = set(), []
         while len(ordered) < len(self.nodes):
+            before = len(ordered)
             for node in self.nodes.values():
                 if node.id not in placed and placed.issuperset(node.depends + node.after):
                     placed.add(node.id)
                     ordered.append(node.id)
+            if len(ordered) == before:
+                missing = {name for node in self.nodes.values()
+                           for name in node.depends + node.after} - self.nodes.keys()
+                if missing:
+                    raise ValueError(f"Graph {self.id} is missing dependencies: "
+                                     f"{', '.join(sorted(missing))}")
+                raise ValueError(f"Graph {self.id} has a cycle through "
+                                 f"{', '.join(sorted(self.nodes.keys() - placed))}")
         return ordered
 
 
@@ -168,14 +177,7 @@ def parse(value) -> Graph:
                 raise ValueError(f"node {node.id} input {path} is the output of {owners[path]}; "
                                  "depend on that node instead")
     graph = Graph(graph_id, nodes)
-    placed = set()
-    while len(placed) < len(nodes):
-        free = [n.id for n in nodes.values()
-                if n.id not in placed and placed.issuperset(n.depends + n.after)]
-        if not free:
-            raise ValueError(f"Graph {graph_id} has a cycle through "
-                             f"{', '.join(sorted(set(nodes) - placed))}")
-        placed.update(free)
+    graph.order()
     return graph
 
 

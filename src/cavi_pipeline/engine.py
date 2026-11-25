@@ -200,7 +200,7 @@ class Engine:
             event = decide(graph, run_dir, {**values["nodes"], **resets})
             event["nodes"] = {**resets, **event.get("nodes", {})}
             self._invoke(Command(resume=event), run)
-        return self.status(run)
+            return self._status(run)
 
     # Actions.
 
@@ -220,15 +220,20 @@ class Engine:
         if not directory.is_dir():
             raise ValueError(f"{run_dir} is not a directory in the runs workspace")
         run = f"{graph_id}-{uuid.uuid4().hex[:8]}"
-        self.registry.add_run(run, graph_id, str(directory))
         initial = {"run": run, "graph": graph_id, "run_dir": str(directory), "cancelled": False,
                    "nodes": {node_id: _entry() for node_id in graph.nodes}}
         with self._lock(run):
+            self.registry.add_run(run, graph_id, str(directory))
             self._invoke(initial, run)
-        return self.status(run)
+            return self._status(run)
 
     def status(self, run) -> dict:
         self.registry.run(run)
+        # Read the checkpoint, evidence and reservations between writes to this run.
+        with self._lock(run):
+            return self._status(run)
+
+    def _status(self, run) -> dict:
         snapshot = self._snapshot(run)
         values = snapshot.values
         graph, nodes = self._graph(values), values["nodes"]

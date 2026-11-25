@@ -2,7 +2,9 @@ import json
 import os
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
+from threading import Event
 
 from cavi_pipeline import Engine, load_directory
 
@@ -102,6 +104,45 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not the current revision"):
             self.h.engine.begin(run, "research", first["revision"])
         self.assertEqual(statuses(self.h.engine.status(run))["research"], "ready")
+
+    def test_status_waits_for_an_in_progress_write_to_the_same_run(self):
+        run, _ = self.h.start()
+        for node_id in CHAIN[:-1]:
+            self.h.finish(run, node_id)
+        view = self.h.engine.begin(run, "layout", self.h.engine.status(run)["revision"])
+        self.h.write(run, "layout")
+
+        rendering, finish_render, reading = Event(), Event(), Event()
+
+        def render(run_dir):
+            rendering.set()
+            if not finish_render.wait(timeout=10):
+                raise RuntimeError("Timed out waiting to finish the test render")
+            self.h.render(run_dir)
+
+        reader = self.h.open()
+        self.addCleanup(reader.close)
+        self.h.engine.hooks["render"] = render
+
+        def status():
+            reading.set()
+            return reader.status(run)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            write = pool.submit(self.h.engine.record, run, "layout", view["revision"])
+            try:
+                self.assertTrue(rendering.wait(timeout=5))
+                read = pool.submit(status)
+                self.assertTrue(reading.wait(timeout=5))
+                with self.assertRaises(TimeoutError):
+                    read.result(timeout=0.25)
+            finally:
+                finish_render.set()
+            written, observed = write.result(timeout=5), read.result(timeout=5)
+
+        self.assertEqual(observed["revision"], written["revision"])
+        self.assertEqual(row(observed, "render")["status"], "done")
+        self.assertNotIn("holds", row(observed, "render"))
 
     def test_record_needs_the_outputs_and_a_passing_check(self):
         run, view = self.h.start()
