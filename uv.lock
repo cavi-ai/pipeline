@@ -43,11 +43,15 @@ wheels = [
 
 [[package]]
 name = "cavi-mcp-core"
-version = "0.1.9.dev26+g98f7f0b7f"
-source = { git = "https://github.com/cavi-ai/mcp-core.git?branch=main#98f7f0b7f6daeabf44422256833876a5f03ca391" }
+version = "0.1.8"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "mcp" },
     { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/23/86/714874acaee04cf186ee1c8cf234d538b1c7d6ef437b69daa9300a297895/cavi_mcp_core-0.1.8.tar.gz", hash = "sha256:dd3e1fc260748969ee805d86146f9a3b93f48ee18afc62a4e9704ab163308589", size = 97111, upload-time = "2026-11-19T17:42:21.727Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/fa/e53b26be600ee206a6c0f70ea7ad7266730182fccb1080a6ca205f9d6b24/cavi_mcp_core-0.1.8-py3-none-any.whl", hash = "sha256:8c902e9ad907c987b1b677030c32a96bac165f0bac593cc93e0304c22b770fc7", size = 55761, upload-time = "2026-11-19T17:42:19.737Z" },
 ]
 
 [[package]]
@@ -66,7 +70,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cavi-mcp-core", git = "https://github.com/cavi-ai/mcp-core.git?branch=main" },
+    { name = "cavi-mcp-core", specifier = ">=0.1.8" },
     { name = "langgraph", specifier = ">=1.2.24,<2" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.3,<4" },
 ]

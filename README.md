@@ -2,41 +2,64 @@
 
 Workflow engine for CAVI pipeline MCP servers, built on LangGraph. A pipeline server declares its workflows as graph files and mounts the engine; the engine adds the `workflow_*` tools, checkpoints every run in SQLite, tracks the evidence of each finished node, and holds shared resources across runs.
 
-Requires Python 3.15 or newer.
+## Install
+
+Requires Python 3.15 or newer. Download the wheel from [GitHub Releases](https://github.com/cavi-ai/pipeline/releases) into your project directory, then run:
+
+```sh
+uv venv --python 3.15
+uv pip install ./cavi_pipeline-*.whl
+```
 
 ## Mount it in a server
 
+Create a graph directory and a workspace for the example run.
+
+```sh
+mkdir -p graphs runs/demo
+printf 'The demo has one source.\n' > runs/demo/source.md
+```
+
+Save this as `server.py`.
+
 ```python
+import json
 from pathlib import Path
 
 from cavi_mcp_core.server import Server
 from cavi_pipeline import mount
 
-server = Server("my-pipeline", package="my-pipeline")
+
+def read_claims(run_dir: Path) -> list[str]:
+    notes = json.loads((run_dir / "research.json").read_text(encoding="utf-8"))
+    claims = notes.get("claims") if isinstance(notes, dict) else None
+    if not isinstance(claims, list) or not claims or not all(
+        isinstance(claim, str) and claim.strip() for claim in claims
+    ):
+        raise ValueError("research.json needs a nonempty list of claims")
+    return claims
 
 
-def cites_sources(run_dir: Path) -> None:
-    """A check hook: raise ValueError to refuse the record."""
+def write_report(run_dir: Path) -> None:
+    report = "\n".join(read_claims(run_dir)) + "\n"
+    (run_dir / "report.txt").write_text(report, encoding="utf-8")
 
 
-def render(run_dir: Path) -> None:
-    """A run hook: does the work of a step node."""
-
-
-engine = mount(
+root = Path(__file__).resolve().parent
+server = Server("my-pipeline", version="1")
+mount(
     server,
-    graphs=Path(__file__).parent / "graphs",
-    hooks={"cites_sources": cites_sources, "render": render},
-    store=Path("~/.local/state/my-pipeline/pipeline.sqlite").expanduser(),
-    runs=Path("~/my-pipeline/runs").expanduser(),
+    graphs=root / "graphs",
+    hooks={"read_claims": read_claims, "write_report": write_report},
+    store=root / "pipeline.sqlite",
+    runs=root / "runs",
 )
+
+if __name__ == "__main__":
+    server.run(transport="stdio")
 ```
 
-`mount` refuses a graph that names a hook the server did not give.
-
-## Graph files
-
-One JSON file per graph, named after its id, at most 1 MiB and 32 nodes.
+Save this as `graphs/cut.json`.
 
 ```json
 {
@@ -44,14 +67,25 @@ One JSON file per graph, named after its id, at most 1 MiB and 32 nodes.
   "id": "cut",
   "nodes": [
     {"id": "research", "kind": "agent", "inputs": ["source.md"],
-     "outputs": {"notes": "research.json"}, "check": "cites_sources",
-     "task": "Read source.md and write research.json."},
-    {"id": "render", "kind": "step", "depends": ["research"],
-     "outputs": {"frames": "frames.bin"}, "resources": ["gpu"], "run": "render"},
-    {"id": "review", "kind": "approval", "depends": ["render"]}
+     "outputs": {"notes": "research.json"}, "check": "read_claims",
+     "task": "Read source.md and write a JSON object with a claims list to research.json."},
+    {"id": "report", "kind": "step", "depends": ["research"],
+     "outputs": {"report": "report.txt"}, "run": "write_report"},
+    {"id": "review", "kind": "approval", "depends": ["report"]}
   ]
 }
 ```
+
+Configure your MCP client to launch `uv run --no-project python server.py` over stdio from this directory.
+
+1. Call `workflow_start` with `graph` set to `cut` and `run_dir` set to `demo`.
+2. Call `workflow_begin` for `research` using the returned run ID and revision. Read `runs/demo/source.md` and write `{"claims": ["The demo has one source."]}` to `runs/demo/research.json`.
+3. Call `workflow_record` for `research` using the revision from `workflow_begin`. The engine writes `runs/demo/report.txt` and offers `review`.
+4. Read the report and call `workflow_approve` for `review` with decision `approve` and the latest revision. The run reports `complete: true`.
+
+## Graph files
+
+One JSON file per graph, named after its id, at most 1 MiB and 32 nodes. Pass every hook named in a graph to `mount`.
 
 | Field | Meaning |
 |---|---|
