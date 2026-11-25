@@ -297,6 +297,59 @@ class EngineTests(unittest.TestCase):
             self.h.engine.begin(run, "research", view["revision"])
         self.assertNotEqual(self.h.engine.start("cut", "one")["run"], run)
 
+    def test_check_records_the_agent_nodes_whose_checks_pass(self):
+        run, _ = self.h.start()
+        self.h.write(run, "research")
+        self.h.write(run, "outline")
+        view = self.h.engine.check(run, "outline")
+        self.assertEqual(statuses(view)["research"], "done")
+        self.assertEqual(statuses(view)["outline"], "done")
+        self.assertEqual(view["ready"], ["script", "score"])
+        self.assertEqual(self.h.engine.check(run, "outline")["revision"], view["revision"])
+
+        self.h.write(run, "research", '{"claims": []}')
+        with self.assertRaisesRegex(ValueError, "needs at least one claim"):
+            self.h.engine.check(run, "outline")
+        view = self.h.engine.status(run)
+        self.assertEqual(row(view, "research")["status"], "ready")
+        self.assertEqual(row(view, "research")["reason"], "research.json needs at least one claim")
+        self.assertEqual(row(view, "outline")["status"], "waiting")
+
+    def test_require_settles_only_the_dependencies(self):
+        run, _ = self.h.start()
+        with self.assertRaisesRegex(ValueError, "output research.json does not exist"):
+            self.h.engine.require(run, "outline")
+        refused = self.h.engine.status(run)
+        with self.assertRaisesRegex(ValueError, "output research.json does not exist"):
+            self.h.engine.require(run, "outline")
+        self.assertEqual(self.h.engine.status(run)["revision"], refused["revision"])
+        self.h.write(run, "research")
+        self.h.write(run, "outline")
+        view = self.h.engine.require(run, "outline")
+        self.assertEqual(statuses(view)["research"], "done")
+        self.assertEqual(statuses(view)["outline"], "ready")
+
+    def test_settled_agent_nodes_start_steps_and_leave_approvals_to_the_reviewer(self):
+        run, _ = self.h.start()
+        for node_id in (*CHAIN, "score"):
+            self.h.write(run, node_id)
+        self.h.engine.check(run, "layout")
+        view = self.h.engine.check(run, "score")
+        self.assertEqual(statuses(view)["assemble"], "done")
+        self.assertEqual(self.h.output(run, "assemble").read_bytes(), b'frames:"layout""score"')
+        with self.assertRaisesRegex(ValueError, "review is waiting; approval nodes are not"):
+            self.h.engine.require(run, "publish")
+        self.assertTrue(self.h.approve(run)["complete"])
+
+    def test_adopt_returns_the_live_run_of_a_directory(self):
+        run, view = self.h.start()
+        self.assertEqual(self.h.engine.adopt("cut", "one"), run)
+        self.assertEqual(self.h.engine.adopt("cut", str(self.h.runs.resolve() / "one")), run)
+        self.h.engine.cancel(run, view["revision"], "Brief withdrawn")
+        fresh = self.h.engine.adopt("cut", "one")
+        self.assertNotEqual(fresh, run)
+        self.assertEqual(self.h.engine.status(fresh)["ready"], ["research", "score"])
+
     def test_refuses_run_directories_outside_the_runs_workspace(self):
         for value in ("../outside", "/etc", "missing"):
             with self.subTest(value), self.assertRaises(ValueError):

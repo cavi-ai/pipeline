@@ -9,7 +9,7 @@ A pipeline server that mounts the engine exposes one graph per workflow. A run o
 
 ## Node kinds
 
-- `agent`: you do the work. `workflow_begin`, write the node's outputs, then `workflow_record`.
+- `agent`: you do the work. `workflow_begin`, write the node's outputs, then `workflow_record`. When the server's own tools wrote the outputs, those tools record the node; read `workflow_status` after them.
 - `step`: the engine runs it as soon as it is ready. You only see the result.
 - `approval`: a person decides. Ask them, then `workflow_approve` with `approve` or `reject` and their reason.
 

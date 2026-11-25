@@ -2,6 +2,6 @@
 
 from .engine import Engine
 from .spec import Graph, Node, load, load_directory, parse
-from .tools import mount
+from .tools import mount, register
 
-__all__ = ["Engine", "Graph", "Node", "load", "load_directory", "mount", "parse"]
+__all__ = ["Engine", "Graph", "Node", "load", "load_directory", "mount", "parse", "register"]

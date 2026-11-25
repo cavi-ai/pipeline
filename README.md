@@ -117,6 +117,20 @@ Paths are relative to the run directory. An input may not be another node's outp
 
 Every write takes the revision from the latest status and refuses an older one.
 
+## Gate the server's own tools
+
+A server tool that writes a node's outputs itself gates on the engine instead of calling `workflow_begin` and `workflow_record`.
+
+| Method | Effect |
+|---|---|
+| `engine.adopt(graph, run_dir)` | The live run in a run directory, started when it has none |
+| `engine.require(run, node)` | Settle every node `node` depends on and raise the first that is not done |
+| `engine.check(run, node)` | Settle `node` and every node it depends on and raise the first that is not done |
+
+Settling records an agent node done when its dependencies are done and its outputs and check pass, and returns a done node whose check now fails to waiting with the check's message. Approval and step nodes keep their state. A call that changes nothing keeps the revision.
+
+`register(server, engine)` adds the tools when the store or runs directory is only known later: every tool call asks `engine()` for the engine, and an error it raises is the tool's error.
+
 ## Runs
 
 - A recorded node keeps the SHA-256 of its inputs and outputs and the receipts of its dependencies. When any of them changes, the node and everything depending on it show as stale, and the next write returns them to waiting.

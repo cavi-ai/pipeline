@@ -180,6 +180,7 @@ class Engine:
         return snapshot
 
     def _apply(self, run, revision, decide):
+        """Resume ``run`` with the event ``decide`` returns; revision None takes the current one."""
         self.registry.run(run)
         with self._lock(run):
             snapshot = self._snapshot(run)
@@ -188,7 +189,7 @@ class Engine:
                 snapshot = self._snapshot(run)
             values = snapshot.values
             current = snapshot.config["configurable"]["checkpoint_id"]
-            if revision != current:
+            if revision is not None and revision != current:
                 raise ValueError(f"Revision {revision} is not the current revision {current}; "
                                  "read workflow_status and act on what it shows")
             if values["cancelled"]:
@@ -199,7 +200,8 @@ class Engine:
                       for node_id, why in ledger.stale(graph, values["nodes"], run_dir).items()}
             event = decide(graph, run_dir, {**values["nodes"], **resets})
             event["nodes"] = {**resets, **event.get("nodes", {})}
-            self._invoke(Command(resume=event), run)
+            if event["nodes"] or event.get("cancelled"):
+                self._invoke(Command(resume=event), run)
             return self._status(run)
 
     # Actions.
@@ -226,6 +228,81 @@ class Engine:
             self.registry.add_run(run, graph_id, str(directory))
             self._invoke(initial, run)
             return self._status(run)
+
+    def adopt(self, graph_id, run_dir) -> str:
+        """The live run in ``run_dir``, started when the directory has none."""
+        directory = str(inside(self.runs_root, run_dir, strict=True))
+        live = self.registry.live(directory)
+        if live is None:
+            try:
+                return self.start(graph_id, run_dir)["run"]
+            except ValueError:
+                # Another process may have started it between the lookup and the start.
+                live = self.registry.live(directory)
+                if live is None:
+                    raise
+        if live["graph"] != graph_id:
+            raise ValueError(f"Run {live['run']} in {run_dir} is a {live['graph']} run")
+        return live["run"]
+
+    def check(self, run, node_id) -> dict:
+        """Settle ``node_id`` and every node before it by their checks against the files now.
+
+        Raises the reason ``node_id`` is not done; see ``require``.
+        """
+        return self._settle(run, node_id, include=True)
+
+    def require(self, run, node_id) -> dict:
+        """Settle every node ``node_id`` depends on and raise the first one that is not done.
+
+        An agent node whose dependencies are done and whose outputs and check pass is recorded
+        done without workflow_begin; a done node that no longer passes waits again with the
+        check's reason. Approval and step nodes keep their state. Returns the run status.
+        """
+        return self._settle(run, node_id, include=False)
+
+    def _settle(self, run, node_id, include):
+        reasons, first = {}, []
+
+        def decide(graph, run_dir, nodes):
+            self._node(graph, node_id)
+            wanted = graph.ancestors(node_id) | ({node_id} if include else set())
+            merged, update = dict(nodes), {}
+            for current in graph.order():
+                spec, entry = graph.nodes[current], merged[current]
+                if (current not in wanted or spec.kind != "agent"
+                        or any(merged[name]["status"] != "done"
+                               for name in spec.depends + spec.after)):
+                    continue
+                upstream = {name: merged[name]["receipt"] for name in spec.depends}
+                try:
+                    recorded = self._evidence(spec, run_dir, upstream)
+                except ValueError as exc:
+                    reasons[current] = str(exc)
+                    if entry["status"] in ("done", "waiting") and entry["reason"] != str(exc):
+                        update[current] = merged[current] = _entry(attempt=entry["attempt"],
+                                                                    reason=str(exc))
+                    continue
+                receipt = ledger.receipt(recorded)
+                if entry["status"] != "done" or entry["receipt"] != receipt:
+                    self.registry.release(run, current)
+                    update[current] = merged[current] = _entry(
+                        status="done", attempt=entry["attempt"] + 1, evidence=recorded,
+                        receipt=receipt)
+            pending = [name for name in graph.order()
+                       if name in wanted and merged[name]["status"] != "done"]
+            if pending:
+                name = pending[0]
+                kind = graph.nodes[name].kind
+                first.append(reasons.get(name) or (
+                    f"{name} is {merged[name]['status']}; {kind} nodes are not settled by a check"
+                    if kind != "agent" else _why_not_ready(graph, merged, name)))
+            return {"nodes": update}
+
+        status = self._apply(run, None, decide)
+        if first:
+            raise ValueError(first[0])
+        return status
 
     def status(self, run) -> dict:
         self.registry.run(run)
