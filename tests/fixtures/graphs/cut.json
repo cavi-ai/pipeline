@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "id": "cut",
+  "description": "A picture chain and an independent score that meet at assembly, then review and publish.",
+  "nodes": [
+    {"id": "research", "kind": "agent", "inputs": ["source.md"],
+     "outputs": {"notes": "research.json"}, "check": "cites_sources",
+     "task": "Read source.md and write research.json with every claim and its source line."},
+    {"id": "outline", "kind": "agent", "depends": ["research"], "outputs": {"outline": "outline.json"}},
+    {"id": "script", "kind": "agent", "depends": ["outline"], "outputs": {"script": "script.json"}},
+    {"id": "picture", "kind": "agent", "depends": ["research", "script"],
+     "outputs": {"picture": "picture.json"}},
+    {"id": "layout", "kind": "agent", "depends": ["picture"], "outputs": {"layout": "layout.json"}},
+    {"id": "render", "kind": "step", "depends": ["layout"], "outputs": {"frames": "frames.bin"},
+     "resources": ["gpu"], "run": "render"},
+    {"id": "score", "kind": "agent", "outputs": {"score": "score.wav"}, "resources": ["gpu"]},
+    {"id": "assemble", "kind": "step", "depends": ["render", "score"],
+     "outputs": {"final": "final.bin"}, "run": "assemble"},
+    {"id": "review", "kind": "approval", "depends": ["assemble"],
+     "task": "Watch final.bin and approve it, or reject it with what to change."},
+    {"id": "publish", "kind": "step", "depends": ["review"],
+     "outputs": {"receipt": "published.json"}, "run": "publish"}
+  ]
+}
