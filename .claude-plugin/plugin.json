@@ -1,0 +1,10 @@
+{
+  "name": "cavi-pipeline",
+  "version": "0.1.0",
+  "description": "Run, resume, retry, approve and cancel CAVI pipeline workflow graphs through their workflow tools.",
+  "author": {"name": "Sasan Sotoodehfar", "url": "https://cavi-ai.xyz"},
+  "repository": "https://github.com/cavi-ai/pipeline",
+  "license": "MIT",
+  "keywords": ["workflow", "pipeline", "langgraph", "mcp"],
+  "skills": "./skills/"
+}

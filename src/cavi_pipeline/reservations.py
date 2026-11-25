@@ -1,0 +1,113 @@
+"""The runs a store knows and the resources their nodes hold, shared by every process using it."""
+
+import sqlite3
+import time
+from contextlib import contextmanager
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+    run TEXT PRIMARY KEY,
+    graph TEXT NOT NULL,
+    run_dir TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reservations (
+    resource TEXT PRIMARY KEY,
+    run TEXT NOT NULL,
+    node TEXT NOT NULL,
+    at REAL NOT NULL
+);
+"""
+
+
+class Registry:
+    """Runs and reservations in the store's SQLite file."""
+
+    def __init__(self, path):
+        self.path = path
+        db = sqlite3.connect(self.path, timeout=30)
+        try:
+            db.executescript(SCHEMA)
+        finally:
+            db.close()
+
+    @contextmanager
+    def _transaction(self):
+        db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                yield db
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+            db.execute("COMMIT")
+        finally:
+            db.close()
+
+    def add_run(self, run, graph, run_dir):
+        """Register a run; one live run per run directory."""
+        with self._transaction() as db:
+            live = db.execute("SELECT run FROM runs WHERE run_dir = ? AND state = 'live'",
+                              (run_dir,)).fetchone()
+            if live:
+                raise ValueError(f"Run {live[0]} is already live in {run_dir}; cancel it first")
+            db.execute("INSERT INTO runs VALUES (?, ?, ?, 'live', ?)",
+                       (run, graph, run_dir, time.time()))
+
+    def run(self, run) -> dict:
+        with self._transaction() as db:
+            row = db.execute("SELECT run, graph, run_dir, state, created FROM runs WHERE run = ?",
+                             (run,)).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown run {run}")
+        return dict(zip(("run", "graph", "run_dir", "state", "created"), row, strict=True))
+
+    def runs(self) -> list[dict]:
+        with self._transaction() as db:
+            rows = db.execute("SELECT run, graph, run_dir, state, created FROM runs "
+                              "ORDER BY created").fetchall()
+        return [dict(zip(("run", "graph", "run_dir", "state", "created"), row, strict=True))
+                for row in rows]
+
+    def cancel_run(self, run):
+        """Mark the run cancelled and release everything it holds."""
+        with self._transaction() as db:
+            db.execute("UPDATE runs SET state = 'cancelled' WHERE run = ?", (run,))
+            db.execute("DELETE FROM reservations WHERE run = ?", (run,))
+
+    def holder(self, resource):
+        """The (run, node) holding ``resource``, or None."""
+        with self._transaction() as db:
+            return db.execute("SELECT run, node FROM reservations WHERE resource = ?",
+                              (resource,)).fetchone()
+
+    def reserve(self, run, node, resources):
+        """Hold every resource for ``node`` of ``run``, or none of them.
+
+        A resource the same node already holds stays held; one held by any other node refuses.
+        """
+        with self._transaction() as db:
+            for resource in resources:
+                row = db.execute("SELECT run, node FROM reservations WHERE resource = ?",
+                                 (resource,)).fetchone()
+                if row is not None and tuple(row) != (run, node):
+                    raise ValueError(f"{resource} is held by run {row[0]} node {row[1]}")
+            for resource in resources:
+                db.execute("INSERT OR IGNORE INTO reservations VALUES (?, ?, ?, ?)",
+                           (resource, run, node, time.time()))
+
+    def release(self, run, node):
+        with self._transaction() as db:
+            db.execute("DELETE FROM reservations WHERE run = ? AND node = ?", (run, node))
+
+    def held(self, run) -> dict[str, list[str]]:
+        """The resources each node of ``run`` holds."""
+        with self._transaction() as db:
+            rows = db.execute("SELECT node, resource FROM reservations WHERE run = ? "
+                              "ORDER BY resource", (run,)).fetchall()
+        found = {}
+        for node, resource in rows:
+            found.setdefault(node, []).append(resource)
+        return found
