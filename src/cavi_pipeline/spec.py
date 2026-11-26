@@ -6,13 +6,14 @@ from pathlib import Path, PurePosixPath
 
 from cavi_mcp_core.files import parse_json, read_bytes
 
-KINDS = ("step", "agent", "approval")
+KINDS = ("step", "agent", "worker", "approval")
 IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 GRAPH_LIMIT = 1024 * 1024
 MAX_NODES = 32
+MAX_LEVELS = 8
 TASK_LIMIT = 4096
 FIELDS = {"id", "kind", "depends", "after", "inputs", "outputs", "resources", "check", "run",
-          "task"}
+          "task", "level"}
 
 
 @dataclass(frozen=True)
@@ -27,23 +28,36 @@ class Node:
     check: str | None = None
     run: str | None = None
     task: str = ""
+    level: str | None = None
 
     @property
     def output_paths(self) -> tuple[str, ...]:
         return tuple(path for _, path in self.outputs)
 
     def describe(self) -> dict:
-        return {
+        described = {
             "id": self.id, "kind": self.kind, "depends": list(self.depends),
             "after": list(self.after), "inputs": list(self.inputs),
             "outputs": dict(self.outputs), "resources": list(self.resources), "task": self.task,
         }
+        if self.level is not None:
+            described["level"] = self.level
+        return described
 
 
 @dataclass(frozen=True)
 class Graph:
     id: str
     nodes: dict[str, Node]
+    levels: tuple[str, ...] = ()
+
+    def above(self, level: str | None) -> set[str]:
+        """Nodes whose level is higher than ``level``; none when the graph has no levels."""
+        if not self.levels:
+            return set()
+        ceiling = self.levels.index(level)
+        return {node.id for node in self.nodes.values()
+                if self.levels.index(node.level) > ceiling}
 
     def hooks(self) -> set[str]:
         """The check and run hook names the graph needs."""
@@ -112,7 +126,7 @@ def _path(value, what):
     return value
 
 
-def _node(value, index) -> Node:
+def _node(value, index, levels) -> Node:
     if not isinstance(value, dict):
         raise ValueError(f"nodes[{index}] must be an object")
     node_id = _identifier(value.get("id"), f"nodes[{index}].id")
@@ -147,29 +161,43 @@ def _node(value, index) -> Node:
         raise ValueError(f"{where} is an approval and has no outputs or check")
     if set(inputs) & {path for _, path in outputs}:
         raise ValueError(f"{where} lists one path as both input and output")
+    level = value.get("level")
+    if level is None:
+        level = levels[0] if levels else None
+    elif level not in levels:
+        raise ValueError(f"{where} level must be one of the graph levels"
+                         if levels else f"{where} has a level but the graph has no levels")
     return Node(
         id=node_id, kind=kind,
         depends=_names(value.get("depends", []), f"{where} depends"),
         after=_names(value.get("after", []), f"{where} after"),
         inputs=inputs, outputs=outputs,
         resources=_names(value.get("resources", []), f"{where} resources"),
-        check=hooks["check"], run=hooks["run"], task=task,
+        check=hooks["check"], run=hooks["run"], task=task, level=level,
     )
 
 
 def parse(value) -> Graph:
     """A validated graph from its JSON value."""
-    if not isinstance(value, dict) or set(value) - {"version", "id", "description", "nodes"}:
-        raise ValueError("A graph has version, id, an optional description and nodes")
+    if (not isinstance(value, dict)
+            or set(value) - {"version", "id", "description", "levels", "nodes"}):
+        raise ValueError("A graph has version, id, an optional description, optional levels "
+                         "and nodes")
     if value.get("version") != 1:
         raise ValueError("Graph version must be 1")
     graph_id = _identifier(value.get("id"), "Graph id")
+    levels = ()
+    if "levels" in value:
+        levels = _names(value["levels"], f"Graph {graph_id} levels")
+        if not 2 <= len(levels) <= MAX_LEVELS:
+            raise ValueError(f"Graph {graph_id} levels must list 2 to {MAX_LEVELS} names, "
+                             "lowest first")
     raw = value.get("nodes")
     if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_NODES:
         raise ValueError(f"Graph {graph_id} needs 1 to {MAX_NODES} nodes")
     nodes = {}
     for index, item in enumerate(raw):
-        node = _node(item, index)
+        node = _node(item, index, levels)
         if node.id in nodes:
             raise ValueError(f"Graph {graph_id} repeats node {node.id}")
         nodes[node.id] = node
@@ -187,7 +215,7 @@ def parse(value) -> Graph:
             if path in owners:
                 raise ValueError(f"node {node.id} input {path} is the output of {owners[path]}; "
                                  "depend on that node instead")
-    graph = Graph(graph_id, nodes)
+    graph = Graph(graph_id, nodes, levels)
     graph.order()
     return graph
 

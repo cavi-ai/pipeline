@@ -45,6 +45,34 @@ def evidence(node, run_dir, upstream: dict[str, str]) -> dict:
     return {"files": files, "upstream": dict(upstream)}
 
 
+def seal(graph, root) -> dict:
+    """Fingerprints of every input the graph's nodes read; a missing input refuses the run."""
+    sealed = {}
+    for node in graph.nodes.values():
+        for relative in node.inputs:
+            if relative not in sealed:
+                found = _fingerprint(root, relative)
+                if found is None:
+                    raise ValueError(f"node {node.id} input {relative} does not exist")
+                sealed[relative] = found
+    return sealed
+
+
+def changed(graph, nodes: dict, root, sealed: dict) -> dict[str, str]:
+    """Unfinished nodes with an input that differs from its fingerprint when the run started."""
+    found, moved = {}, {}
+    for node_id in graph.order():
+        if nodes[node_id]["status"] == "done":
+            continue
+        for relative in graph.nodes[node_id].inputs:
+            if relative in sealed and relative not in moved:
+                moved[relative] = not _matches(root, relative, sealed[relative])
+            if moved.get(relative):
+                found[node_id] = f"input {relative} changed since the run started"
+                break
+    return found
+
+
 def receipt(recorded: dict) -> str:
     """The digest a dependent node keeps of this node's evidence."""
     canonical = {

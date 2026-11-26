@@ -7,7 +7,7 @@ from pathlib import Path
 from cavi_mcp_core.server import Server
 from mcp import Client
 
-from cavi_pipeline import mount, register
+from cavi_pipeline import Engine, mount, register
 
 FIXTURES = Path(__file__).parent / "fixtures" / "graphs"
 
@@ -51,7 +51,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(set(names), {
             "workflow_list", "workflow_start", "workflow_status", "workflow_begin",
             "workflow_record", "workflow_fail", "workflow_retry", "workflow_approve",
-            "workflow_cancel"})
+            "workflow_escalate", "workflow_cancel"})
         self.assertTrue(names["workflow_status"].annotations.read_only_hint)
         self.assertTrue(names["workflow_cancel"].annotations.destructive_hint)
         self.assertEqual(view(listed)["graphs"][0]["id"], "cut")
@@ -83,6 +83,37 @@ class ToolTests(unittest.TestCase):
         self.assertIn("workflow_status", {tool.name for tool in tools})
         self.assertTrue(refused.is_error)
         self.assertIn("Configure the runs workspace first", refused.content[0].text)
+
+    def test_cancel_holds_a_dispatched_worker_until_server_confirms_it_stopped(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        runs = root / "runs"
+        runs.mkdir()
+        engine = Engine({}, {}, store=root / "state" / "pipeline.sqlite", runs=runs, shared=True)
+        self.addCleanup(engine.close)
+        server = Server("dispatch", version="1")
+        register(server, lambda: engine)
+        document = {"version": 1, "id": "render", "nodes": [
+            {"id": "render", "kind": "worker", "outputs": {"asset": "render.json"}}]}
+        active = engine.start(None, "first", document=document)
+        waiting = engine.start(None, "second", document=document)
+        active = engine.begin(active["run"], "render", active["revision"], dispatch=True)
+
+        _, cancelled = asyncio.run(session(server, [("workflow_cancel", {
+            "run": active["run"], "revision": active["revision"], "reason": "Brief withdrawn",
+        })]))
+        self.assertFalse(cancelled.is_error)
+        cancelled = view(cancelled)
+        self.assertTrue(cancelled["cancelled"])
+        self.assertEqual(cancelled["nodes"][0]["status"], "uncertain")
+        self.assertEqual(cancelled["nodes"][0]["holds"], ["output:render.json"])
+        with self.assertRaisesRegex(ValueError, "held by run"):
+            engine.begin(waiting["run"], "render", waiting["revision"], dispatch=True)
+
+        engine.fail(active["run"], "render", cancelled["revision"], "Worker exited", dispatch=True)
+        waiting = engine.begin(waiting["run"], "render", waiting["revision"], dispatch=True)
+        self.assertEqual(waiting["nodes"][0]["status"], "running")
 
 
 if __name__ == "__main__":
