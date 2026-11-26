@@ -7,6 +7,7 @@ import os
 import sqlite3
 import threading
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Annotated, TypedDict
 
@@ -119,7 +120,7 @@ class Engine:
         self._db = sqlite3.connect(store, check_same_thread=False, timeout=30)
         self._saver = SqliteSaver(self._db)
         self._saver.setup()
-        self.registry = Registry(store)
+        self.registry = Registry(store, workspace=self.runs_root if shared else None)
         self._locks, self._guard, self._documents = {}, threading.Lock(), {}
         builder = StateGraph(RunState)
         builder.add_node("schedule", self._schedule)
@@ -153,13 +154,16 @@ class Engine:
         return Command(goto=sends or "wait")
 
     def _step(self, task):
-        node = self._graph_of(task).nodes[task["node"]]
+        graph = self._graph_of(task)
+        node = graph.nodes[task["node"]]
         run, root, attempt = task["run"], self._root(task), task["attempt"] + 1
         try:
             self.registry.reserve(run, node.id, node.resources, self._outputs(node))
         except ValueError as exc:
             return {"nodes": {node.id: _entry(attempt=task["attempt"], blocked=str(exc))}}
         try:
+            if self.shared:
+                self._protect(graph, Path(task["run_dir"]))
             self.hooks[node.run](root)
             recorded = self._evidence(node, root, task["upstream"])
         except ANTICIPATED as exc:
@@ -299,14 +303,16 @@ class Engine:
             raise ValueError(f"Run {run} has no state in this store")
         return snapshot
 
-    def _apply(self, run, revision, decide, *, max_events=1, cancelled=False):
+    def _apply(self, run, revision, decide, *, max_events=1, cancelled=False, cleanup=None):
         """Apply events under the run lock, checking the revision before the first write.
 
         ``decide(graph, root, nodes, values)`` returns the event; with ``cancelled`` it also
         runs on a cancelled run, where a failure it records shows as cancelled.
+        Temporary reservations can be released through ``cleanup`` after the scheduler runs.
         """
         self.registry.run(run)
-        with self._lock(run):
+        cleanup = ExitStack() if cleanup is None else cleanup
+        with self._lock(run), cleanup:
             snapshot = self._snapshot(run)
             if snapshot.next and not snapshot.interrupts:
                 self._invoke(None, run)
@@ -338,6 +344,7 @@ class Engine:
                     break
                 event["nodes"] = {**resets, **event.get("nodes", {})}
                 self._invoke(Command(resume=event), run)
+            cleanup.close()
             return self._status(run)
 
     # Actions.
@@ -378,12 +385,15 @@ class Engine:
             raise ValueError(f"Graph {graph.id} has no levels")
         directory = inside(self.runs_root, run_dir, strict=True)
         sealed = {}
+        paths = ()
         if self.shared:
             if directory.exists() or directory.is_symlink():
                 raise ValueError(f"{run_dir} exists; a shared-workspace run starts in a new "
                                  "directory")
             self._protect(graph, directory)
             sealed = ledger.seal(graph, self.runs_root)
+            paths = tuple(path for node in graph.nodes.values()
+                          for path in (*node.inputs, *node.output_paths))
         elif not directory.is_dir():
             raise ValueError(f"{run_dir} is not a directory in the runs workspace")
         run = f"{graph_id}-{uuid.uuid4().hex[:8]}"
@@ -392,15 +402,15 @@ class Engine:
                    "sealed": sealed,
                    "graph_sha256": None if raw is None else hashlib.sha256(raw).hexdigest()}
         with self._lock(run):
-            if self.shared:
-                try:
-                    directory.mkdir(parents=True, mode=0o700)
-                except FileExistsError:
-                    raise ValueError(f"{run_dir} exists; a shared-workspace run starts in a new "
-                                     "directory") from None
-                if raw is not None:
-                    self._write_graph(directory / GRAPH_FILE, raw)
-            self.registry.add_run(run, graph_id, str(directory))
+            with self.registry.add_run(run, graph_id, str(directory), paths=paths):
+                if self.shared:
+                    try:
+                        directory.mkdir(parents=True, mode=0o700)
+                    except FileExistsError:
+                        raise ValueError(f"{run_dir} exists; a shared-workspace run starts in a "
+                                         "new directory") from None
+                    if raw is not None:
+                        self._write_graph(directory / GRAPH_FILE, raw)
             self._invoke(initial, run)
             return self._status(run)
 
@@ -448,6 +458,7 @@ class Engine:
     def _settle(self, run, node_id, include):
         wanted, checked, retried = set(), set(), set()
         reasons = {}
+        reservations = ExitStack()
 
         def decide(graph, root, nodes, values):
             self._node(graph, node_id)
@@ -465,6 +476,10 @@ class Engine:
                     continue
                 checked.add(current)
                 upstream = {name: merged[name]["receipt"] for name in spec.depends}
+                outputs = self._outputs(spec)
+                if outputs:
+                    self.registry.reserve(run, current, (), outputs)
+                    reservations.callback(self.registry.release, run, current)
                 try:
                     recorded = self._evidence(spec, root, upstream)
                 except ValueError as exc:
@@ -476,7 +491,8 @@ class Engine:
                     receipt = ledger.receipt(recorded)
                     if entry["status"] == "done" and entry["receipt"] == receipt:
                         continue
-                    self.registry.release(run, current)
+                    if not outputs:
+                        self.registry.release(run, current)
                     next_entry = _entry(
                         status="done", attempt=entry["attempt"] + 1, evidence=recorded,
                         receipt=receipt)
@@ -504,7 +520,8 @@ class Engine:
             return {"nodes": update}
 
         # Steps can unblock another layer of agents on each scheduler pass.
-        status = self._apply(run, _CURRENT_REVISION, decide, max_events=MAX_NODES + 1)
+        status = self._apply(run, _CURRENT_REVISION, decide, max_events=MAX_NODES + 1,
+                             cleanup=reservations)
         for row in status["nodes"]:
             name, kind, state = row["id"], row["kind"], row["status"]
             if name not in wanted or state == "done":
@@ -626,15 +643,15 @@ class Engine:
             moved = self._excluded(graph, values, nodes).get(node_id)
             if moved:
                 raise ValueError(f"{node_id} cannot record: {moved}")
+            replacement = entry.get("detail") if detail is _KEEP else _detail(detail)
             if self.shared:
                 self._protect(graph, Path(values["run_dir"]))
             recorded = self._evidence(node, root,
                                       {name: nodes[name]["receipt"] for name in node.depends})
+            done = _entry(status="done", attempt=entry["attempt"], evidence=recorded,
+                          receipt=ledger.receipt(recorded), note=note, detail=replacement)
             self.registry.release(run, node_id)
-            return {"nodes": {node_id: _entry(
-                status="done", attempt=entry["attempt"], evidence=recorded,
-                receipt=ledger.receipt(recorded), note=note,
-                detail=entry.get("detail") if detail is _KEEP else _detail(detail))}}
+            return {"nodes": {node_id: done}}
         return self._apply(run, revision, decide)
 
     def fail(self, run, node_id, revision, reason, uncertain=False, *, dispatch=False,
@@ -648,15 +665,17 @@ class Engine:
             node, entry = self._node(graph, node_id), nodes.get(node_id)
             if node.kind == "worker":
                 _writable(node, dispatch, "fails")
-            if node.kind not in ("agent", "worker") or entry["status"] not in ACTIVE:
+            uncertain_step = node.kind == "step" and entry["status"] == "uncertain"
+            if not (uncertain_step or (node.kind in ("agent", "worker")
+                                       and entry["status"] in ACTIVE)):
                 raise ValueError(f"{node_id} is {entry['status']}; only a running or uncertain "
-                                 "agent node fails")
+                                 "agent or worker, or an uncertain step, can fail")
+            failure = _entry(status="uncertain" if uncertain else "failed",
+                             attempt=entry["attempt"], reason=reason,
+                             detail=entry.get("detail") if detail is _KEEP else _detail(detail))
             if not uncertain:
                 self.registry.release(run, node_id)
-            return {"nodes": {node_id: _entry(
-                status="uncertain" if uncertain else "failed", attempt=entry["attempt"],
-                reason=reason,
-                detail=entry.get("detail") if detail is _KEEP else _detail(detail))}}
+            return {"nodes": {node_id: failure}}
         return self._apply(run, revision, decide, cancelled=True)
 
     def retry(self, run, node_id, revision, *, dispatch=False, detail=None) -> dict:
@@ -722,11 +741,12 @@ class Engine:
         return self._apply(run, revision, decide)
 
     def cancel(self, run, revision, reason, *, hold=False) -> dict:
-        """End a run. With ``hold``, running and uncertain nodes stay uncertain and keep their
-        reservations until a failure records their outcome."""
+        """End a run while keeping unresolved workers' reservations until they are confirmed
+        stopped. With ``hold``, keep the reservations of any running or uncertain node."""
         def decide(graph, root, nodes, values):
             kept = [node_id for node_id, entry in nodes.items()
-                    if hold and entry["status"] in ACTIVE]
+                    if entry["status"] in ACTIVE
+                    and (hold or graph.nodes[node_id].kind == "worker")]
             self.registry.cancel_run(run, keep=kept)
             update = {}
             for node_id, entry in nodes.items():

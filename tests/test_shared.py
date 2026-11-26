@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cavi_pipeline import Engine, load_directory
 
@@ -127,6 +128,98 @@ class SharedWorkspaceTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in (self.workspace / "runs").iterdir()),
                          ["one"])
 
+    def test_run_directory_cannot_overlap_a_reserved_output(self):
+        producer = self.start(level=None, value=one_node("exports/report.json"))
+        producer = self.engine.begin(producer["run"], "producer", producer["revision"])
+        for directory in ("exports", "exports/report.json", "exports/report.json/child"):
+            with self.subTest(directory), self.assertRaisesRegex(ValueError, "held by run"):
+                self.start(directory, level=None, value=one_node("other.json"))
+        self.assertFalse((self.workspace / "exports").exists())
+        self.engine.fail(producer["run"], "producer", producer["revision"], "Producer stopped")
+        self.start("exports/report.json", level=None, value=one_node("other.json"))
+        self.assertTrue((self.workspace / "exports/report.json").is_dir())
+
+    def test_reserve_refuses_a_run_directory_created_after_path_validation(self):
+        producer = self.start(level=None, value=one_node("exports/report.json"))
+        second_engine = Engine({}, {}, store=self.root / "state" / "workflow.sqlite",
+                               runs=self.workspace, shared=True)
+        self.addCleanup(second_engine.close)
+        protect = self.engine._protect
+
+        def create_after_validation(graph, directory):
+            protect(graph, directory)
+            second_engine.start(None, "exports/report.json", document=one_node("other.json"))
+
+        with (patch.object(self.engine, "_protect", side_effect=create_after_validation),
+              self.assertRaisesRegex(ValueError, "overlaps the directory of run")):
+            self.engine.begin(producer["run"], "producer", producer["revision"])
+        status = self.engine.status(producer["run"])
+        self.assertEqual(status["revision"], producer["revision"])
+        self.assertNotIn("holds", row(status, "producer"))
+
+    def test_check_and_require_defer_until_a_shared_output_is_released(self):
+        document = one_node("outline.json")
+        document["nodes"].append({"id": "consumer", "kind": "agent", "depends": ["producer"]})
+        consumer = self.start("runs/consumer", level=None, value=document)
+        producer = self.start("runs/producer", level=None, value=one_node("outline.json"))
+        producer = self.engine.begin(producer["run"], "producer", producer["revision"])
+        output = self.workspace / "outline.json"
+        output.write_text('{"draft": true}')
+
+        for check, node in ((self.engine.check, "producer"), (self.engine.require, "consumer")):
+            with self.subTest(check=check.__name__), self.assertRaisesRegex(ValueError, "held"):
+                check(consumer["run"], node)
+            after = self.engine.status(consumer["run"])
+            self.assertEqual(after["revision"], consumer["revision"])
+            self.assertEqual(row(after, "consumer")["status"], "waiting")
+
+        output.write_text('{"draft": false}')
+        self.engine.record(producer["run"], "producer", producer["revision"])
+        settled = self.engine.require(consumer["run"], "consumer")
+        self.assertEqual(row(settled, "producer")["status"], "done")
+        self.assertEqual(row(settled, "consumer")["status"], "ready")
+        self.assertNotIn("holds", row(settled, "producer"))
+
+    def test_settled_output_stays_reserved_while_its_dependent_step_runs(self):
+        writer = self.start("runs/writer", level=None, value=one_node("outline.json"))
+        document = one_node("outline.json")
+        document["nodes"].append({"id": "render", "kind": "step", "depends": ["producer"],
+                                  "run": "render", "outputs": {"asset": "render.json"}})
+
+        def render(root):
+            with self.assertRaisesRegex(ValueError, "held by run"):
+                self.engine.begin(writer["run"], "producer", writer["revision"])
+            (root / "render.json").write_text((root / "outline.json").read_text())
+
+        self.engine.hooks["render"] = render
+        consumer = self.start(level=None, value=document)
+        (self.workspace / "outline.json").write_text('{"draft": false}')
+        settled = self.engine.check(consumer["run"], "render")
+        self.assertEqual(row(settled, "render")["status"], "done")
+        self.assertEqual((self.workspace / "render.json").read_text(), '{"draft": false}')
+        self.assertNotIn("holds", row(settled, "producer"))
+        writer = self.engine.begin(writer["run"], "producer", writer["revision"])
+        self.assertEqual(row(writer, "producer")["status"], "running")
+
+    def test_step_revalidates_shared_paths_after_waiting_for_a_dependency(self):
+        document = {"version": 1, "id": "render", "nodes": [
+            {"id": "review", "kind": "approval"},
+            {"id": "render", "kind": "step", "depends": ["review"], "run": "render",
+             "inputs": ["brief.json"], "outputs": {"asset": "render.json"}},
+        ]}
+
+        def render(root):
+            (root / "render.json").write_text('{"rendered": true}')
+
+        self.engine.hooks["render"] = render
+        started = self.start(level=None, value=document)
+        brief = self.workspace / "brief.json"
+        (self.workspace / "render.json").hardlink_to(brief)
+        status = self.engine.approve(started["run"], "review", started["revision"], True)
+        self.assertEqual(brief.read_text(), '{"seed": 1}')
+        self.assertEqual(row(status, "render")["status"], "failed")
+        self.assertIn("is a link to an input", row(status, "render")["reason"])
+
     def test_levels_defer_nodes_until_the_run_is_escalated(self):
         view = self.start(level="draft")
         self.assertEqual(view["level"], "draft")
@@ -176,6 +269,53 @@ class SharedWorkspaceTests(unittest.TestCase):
         self.assertNotIn("holds", row(view, "outline"))
         view = self.engine.retry(view["run"], "outline", view["revision"])
         self.assertIn("outline", view["ready"])
+
+    def test_invalid_worker_detail_keeps_the_checkpoint_and_reservations(self):
+        document = one_node("outline.json")
+        document["nodes"][0].update(kind="worker", resources=["studio"])
+        competitor = self.start("runs/competitor", level=None, value=one_node("outline.json"))
+        (self.workspace / "outline.json").write_text("{}")
+        for method, args, detail in (
+            (self.engine.record, (), {"invalid": object()}),
+            (self.engine.fail, ("Producer stopped",), {"oversized": "a" * 1024 * 1024}),
+        ):
+            with self.subTest(method=method.__name__):
+                producer = self.start(f"runs/{method.__name__}", level=None, value=document)
+                producer = self.engine.begin(producer["run"], "producer", producer["revision"],
+                                             dispatch=True, detail={"job": "one"})
+                with self.assertRaisesRegex(ValueError, "node detail"):
+                    method(producer["run"], "producer", producer["revision"], *args,
+                           dispatch=True, detail=detail)
+                self.assertEqual(self.engine.status(producer["run"]), producer)
+                with self.assertRaisesRegex(ValueError, "held by run"):
+                    self.engine.begin(competitor["run"], "producer", competitor["revision"])
+                finished = method(producer["run"], "producer", producer["revision"], *args,
+                                  dispatch=True)
+                self.assertEqual(row(finished, "producer")["detail"], {"job": "one"})
+                self.assertNotIn("holds", row(finished, "producer"))
+
+    def test_confirming_an_uncertain_step_stopped_releases_held_cancel_reservations(self):
+        document = one_node("outline.json")
+        document["nodes"][0].update(kind="step", run="render", resources=["studio"])
+
+        def render(root):
+            raise KeyError("missing renderer result")
+
+        self.engine.hooks["render"] = render
+        with self.assertLogs("cavi_pipeline.engine", "ERROR"):
+            stopped = self.start(level=None, value=document)
+        stopped = self.engine.cancel(stopped["run"], stopped["revision"], "Cancel render",
+                                     hold=True)
+        next_run = self.start("runs/next", level=None, value=one_node("outline.json"))
+        with self.assertRaisesRegex(ValueError, "held by run"):
+            self.engine.begin(next_run["run"], "producer", next_run["revision"])
+
+        stopped = self.engine.fail(stopped["run"], "producer", stopped["revision"],
+                                   "Confirmed the render stopped")
+        self.assertEqual(row(stopped, "producer")["status"], "cancelled")
+        self.assertNotIn("holds", row(stopped, "producer"))
+        started = self.engine.begin(next_run["run"], "producer", next_run["revision"])
+        self.assertEqual(row(started, "producer")["status"], "running")
 
     def test_a_held_cancel_keeps_unresolved_work_until_its_outcome_is_known(self):
         first, second = self.start("runs/one"), self.start("runs/two")

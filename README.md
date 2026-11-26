@@ -113,11 +113,11 @@ A graph may list `levels`, 2 to 8 names from lowest to highest, such as `["draft
 | `workflow_status` | Every node, ready nodes and their tasks, stale nodes, the current revision |
 | `workflow_begin` | Reserve a ready agent node's resources and mark it running |
 | `workflow_record` | Mark a running agent node done once its outputs exist and its check passes |
-| `workflow_fail` | Mark a running or uncertain agent node failed, or a running one uncertain when its outcome is unknown |
+| `workflow_fail` | Mark a running agent failed or uncertain, or resolve an uncertain agent or step |
 | `workflow_retry` | Return a failed or uncertain node to waiting, or run a waiting step again |
 | `workflow_approve` | Approve or reject a ready approval node |
 | `workflow_escalate` | Raise the level of a run; it never lowers |
-| `workflow_cancel` | End a run and release its resources |
+| `workflow_cancel` | End a run. Unresolved workers keep their reservations until the server confirms they stopped |
 
 Every write takes the revision from the latest status and refuses an older one. The tools refuse writes to worker nodes.
 
@@ -131,7 +131,7 @@ A server tool that writes a node's outputs itself gates on the engine instead of
 | `engine.require(run, node)` | Settle every node `node` depends on and raise the first that is not done |
 | `engine.check(run, node)` | Settle `node` and every node it depends on and raise the first that is not done |
 
-Settling records an eligible agent node done when its dependencies are done and its outputs and check pass. Running and uncertain agents keep their attempts and reservations. A failed check returns a completed agent to waiting and invalidates nodes that depend on it. The scheduler runs ready steps, including previously blocked steps whose resources are now free. Approval nodes still require a decision. A call that changes nothing keeps the revision.
+Settling records an eligible agent node done when its dependencies are done and its outputs and check pass. In a shared workspace, settling reserves outputs while it checks them and runs steps they unblock. Running and uncertain agents keep their attempts and reservations. A failed check returns a completed agent to waiting and invalidates nodes that depend on it. The scheduler runs ready steps, including previously blocked steps whose resources are now free. Approval nodes still require a decision. A call that changes nothing keeps the revision.
 
 `register(server, engine)` adds the tools when the store or runs directory is only known later: every tool call asks `engine()` for the engine, and an error it raises is the tool's error.
 
@@ -143,22 +143,22 @@ Server code dispatches worker nodes through the same methods the tools use, with
 | `engine.annotate(run, node, revision, detail)` | Replace the detail of a running node |
 | `engine.record(..., dispatch=True)`, `engine.fail(..., dispatch=True)`, `engine.retry(..., dispatch=True)` | Finish, fail or retry a worker; record and fail keep the detail unless given one, retry sets the detail of the waiting entry |
 | `engine.evidence(run)` | The inputs the run sealed and the files and receipts each done node recorded |
-| `engine.cancel(run, revision, reason, hold=True)` | End a run but keep running and uncertain nodes uncertain, with their reservations, until `fail` records their outcome |
+| `engine.cancel(run, revision, reason, hold=True)` | End a run and keep all unresolved nodes' reservations until `fail` records their outcome. Unresolved workers retain reservations with either value of `hold` |
 
 ## Shared workspace
 
 `Engine(..., shared=True)`, or `mount(..., shared=True)`, runs graphs whose paths are relative to the runs workspace itself, for pipelines whose runs read and write one shared tree.
 
-- A run starts in a new directory under the workspace; the directory holds only the run's own records.
+- A run starts in a new directory under the workspace that holds only its records. Its directory cannot overlap a reserved output.
 - `engine.start(None, run_dir, level, document=graph)` starts a run of a graph value instead of a server graph. The run keeps a read-only `graph.json` in its directory and refuses to continue once that copy changes.
 - Every input is fingerprinted when the run starts. A node whose input changed afterwards shows `stale` and never becomes ready in that run; a running node shows the change under `changed` and cannot record.
 - A running node holds its output paths as well as its resources. A path inside or around a held output, compared without case, waits; a ready node shows the holder under `blocked`.
-- Start, begin and record refuse an input or output inside a run directory or the store directory, a path that is not a regular file, and an output that is a hard link to an input.
+- Start, begin, record and automatic steps refuse an input or output inside a run directory or the store directory, a path that is not a regular file, and an output that is a hard link to an input.
 
 ## Runs
 
 - A recorded node keeps the SHA-256 of its inputs and outputs and the receipts of its dependencies. When any of them changes, the node and everything depending on it show as stale, and the next write returns them to waiting.
-- Step nodes run as soon as they are ready. A step that raises ValueError, RuntimeError or OSError fails with that message; any other exception leaves it uncertain, holding its resources until it is retried.
+- Step nodes run as soon as they are ready. A step that raises ValueError, RuntimeError or OSError fails with that message. Any other exception leaves it uncertain, holding its resources until it is retried or its outcome is confirmed.
 - A ready node whose resource another node holds shows `blocked` with the holder, and starts on a later write once the resource is free.
 - Failing an uncertain node records that its outcome is known and releases its resources.
 - A run directory holds one live run. Runs survive a server restart; a new engine on the same store continues them.

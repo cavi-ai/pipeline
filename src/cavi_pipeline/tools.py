@@ -73,7 +73,7 @@ def register(server, engine) -> None:
     @server.tool(annotations=WRITES)
     async def workflow_fail(run: str, node: str, revision: str, reason: Text,
                             uncertain: bool = False) -> dict[str, Any]:
-        """Mark a running agent node failed; uncertain=true when its outcome is unknown.
+        """Mark a running agent failed or uncertain, or resolve an uncertain agent or step.
 
         An uncertain node keeps its resources until workflow_retry, or until workflow_fail
         records what its outcome turned out to be.
@@ -99,5 +99,6 @@ def register(server, engine) -> None:
 
     @server.tool(annotations=DESTRUCTIVE)
     async def workflow_cancel(run: str, revision: str, reason: Text) -> dict[str, Any]:
-        """Cancel a run and release every resource it holds; a cancelled run takes no writes."""
+        """Cancel a run. Unresolved workers keep their reservations until the server confirms
+        they stopped."""
         return await call("cancel", run, revision, reason)

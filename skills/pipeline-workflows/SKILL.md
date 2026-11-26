@@ -32,4 +32,4 @@ Every write takes the `revision` from the latest status. A refused revision mean
 - A step that fails shows its reason; fix the cause, then `workflow_retry` it.
 - A node whose outputs or inputs changed after it was recorded shows as `stale`, and so does everything that depends on it. The next write returns them to waiting; do them again in order.
 - `blocked` on a ready node names the run holding a resource it needs. It starts on the next write once the resource is free; `workflow_retry` starts a blocked step again.
-- `workflow_cancel` ends a run and releases its resources. A cancelled run takes no writes.
+- `workflow_cancel` ends a run. Unresolved workers keep their reservations until the server confirms they stopped.
