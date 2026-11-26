@@ -51,7 +51,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(set(names), {
             "workflow_list", "workflow_start", "workflow_status", "workflow_begin",
             "workflow_record", "workflow_fail", "workflow_retry", "workflow_approve",
-            "workflow_cancel"})
+            "workflow_escalate", "workflow_cancel"})
         self.assertTrue(names["workflow_status"].annotations.read_only_hint)
         self.assertTrue(names["workflow_cancel"].annotations.destructive_hint)
         self.assertEqual(view(listed)["graphs"][0]["id"], "cut")

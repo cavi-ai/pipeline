@@ -46,12 +46,29 @@ class SpecTests(unittest.TestCase):
             "depend on that node instead": lambda v: node(v, "outline").update(
                 inputs=["research.json"]),
             "repeats node": lambda v: v["nodes"].append(copy.deepcopy(node(v, "outline"))),
-            "kind must be one of": lambda v: node(v, "outline").update(kind="worker"),
+            "kind must be one of": lambda v: node(v, "outline").update(kind="robot"),
             "version must be 1": lambda v: v.update(version=2),
+            "has a level but the graph has no levels": lambda v: node(v, "outline").update(
+                level="full"),
+            "level must be one of the graph levels": lambda v: (
+                v.update(levels=["draft", "full"]), node(v, "outline").update(level="final")),
+            "levels must list 2 to 8 names": lambda v: v.update(levels=["only"]),
         }
         for message, change in cases.items():
             with self.subTest(message), self.assertRaisesRegex(ValueError, message):
                 spec.parse(variant(change))
+
+    def test_levels_default_to_the_lowest_and_name_the_nodes_above(self):
+        def change(value):
+            value["levels"] = ["draft", "preview", "full"]
+            node(value, "publish").update(level="full")
+            node(value, "review").update(level="preview")
+
+        graph = spec.parse(variant(change))
+        self.assertEqual(graph.nodes["research"].level, "draft")
+        self.assertEqual(graph.above("draft"), {"review", "publish"})
+        self.assertEqual(graph.above("preview"), {"publish"})
+        self.assertEqual(graph.above("full"), set())
 
     def test_order_rejects_unplaceable_programmatic_graphs(self):
         cases = (

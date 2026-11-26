@@ -12,14 +12,15 @@ from .spec import load_directory
 Text = Annotated[str, Field(min_length=1, max_length=4096)]
 
 
-def mount(server, *, graphs, hooks, store, runs) -> Engine:
+def mount(server, *, graphs, hooks, store, runs, shared=False) -> Engine:
     """Add the workflow tools to ``server`` and return the engine behind them.
 
     ``graphs`` is a directory of graph files, ``hooks`` maps every hook name they use to a
-    callable taking the run directory, ``store`` is the SQLite file that keeps the runs and
-    ``runs`` the directory holding run directories.
+    callable taking the directory node paths resolve against, ``store`` is the SQLite file
+    that keeps the runs, ``runs`` the directory holding run directories, and ``shared`` makes
+    node paths relative to ``runs`` instead of each run directory.
     """
-    engine = Engine(load_directory(graphs), hooks, store=store, runs=runs)
+    engine = Engine(load_directory(graphs), hooks, store=store, runs=runs, shared=shared)
     register(server, lambda: engine)
     return engine
 
@@ -40,13 +41,15 @@ def register(server, engine) -> None:
         return await call("catalog")
 
     @server.tool(annotations=WRITES)
-    async def workflow_start(graph: str, run_dir: str) -> dict[str, Any]:
-        """Start a run of a graph in an existing directory under the runs workspace.
+    async def workflow_start(graph: str, run_dir: str,
+                             level: str | None = None) -> dict[str, Any]:
+        """Start a run of a graph in a directory under the runs workspace.
 
+        A graph with levels runs the nodes up to ``level``, its lowest level by default.
         Returns the run status: ready nodes, the tasks of ready agent and approval nodes,
         and the revision every later write must pass.
         """
-        return await call("start", graph, run_dir)
+        return await call("start", graph, run_dir, level)
 
     @server.tool(annotations=READ_ONLY)
     async def workflow_status(run: str) -> dict[str, Any]:
@@ -72,7 +75,8 @@ def register(server, engine) -> None:
                             uncertain: bool = False) -> dict[str, Any]:
         """Mark a running agent node failed; uncertain=true when its outcome is unknown.
 
-        An uncertain node keeps its resources until workflow_retry.
+        An uncertain node keeps its resources until workflow_retry, or until workflow_fail
+        records what its outcome turned out to be.
         """
         return await call("fail", run, node, revision, reason, uncertain)
 
@@ -87,6 +91,11 @@ def register(server, engine) -> None:
                                reason: Text | None = None) -> dict[str, Any]:
         """Approve or reject a ready approval node; a rejection needs a reason."""
         return await call("approve", run, node, revision, decision == "approve", reason)
+
+    @server.tool(annotations=WRITES)
+    async def workflow_escalate(run: str, level: str, revision: str) -> dict[str, Any]:
+        """Raise the level of a run so nodes up to ``level`` can run; it never lowers."""
+        return await call("escalate", run, level, revision)
 
     @server.tool(annotations=DESTRUCTIVE)
     async def workflow_cancel(run: str, revision: str, reason: Text) -> dict[str, Any]:

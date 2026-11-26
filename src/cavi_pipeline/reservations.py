@@ -3,6 +3,10 @@
 import sqlite3
 import time
 from contextlib import contextmanager
+from pathlib import PurePosixPath
+
+# Output paths are held under this prefix; resource names are identifiers and never contain it.
+OUTPUT = "output:"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -79,11 +83,13 @@ class Registry:
         return [dict(zip(("run", "graph", "run_dir", "state", "created"), row, strict=True))
                 for row in rows]
 
-    def cancel_run(self, run):
-        """Mark the run cancelled and release everything it holds."""
+    def cancel_run(self, run, keep=()):
+        """Mark the run cancelled and release everything it holds except the ``keep`` nodes'."""
         with self._transaction() as db:
             db.execute("UPDATE runs SET state = 'cancelled' WHERE run = ?", (run,))
-            db.execute("DELETE FROM reservations WHERE run = ?", (run,))
+            kept = list(keep)
+            db.execute("DELETE FROM reservations WHERE run = ? AND node NOT IN "
+                       f"({', '.join('?' * len(kept))})", (run, *kept))
 
     def holder(self, resource):
         """The (run, node) holding ``resource``, or None."""
@@ -91,18 +97,43 @@ class Registry:
             return db.execute("SELECT run, node FROM reservations WHERE resource = ?",
                               (resource,)).fetchone()
 
-    def reserve(self, run, node, resources):
-        """Hold every resource for ``node`` of ``run``, or none of them.
+    @staticmethod
+    def _conflict(db, run, node, resources, outputs):
+        for resource in resources:
+            row = db.execute("SELECT run, node FROM reservations WHERE resource = ?",
+                             (resource,)).fetchone()
+            if row is not None and tuple(row) != (run, node):
+                return f"{resource} is held by run {row[0]} node {row[1]}"
+        if outputs:
+            held = db.execute("SELECT resource, run, node FROM reservations "
+                              "WHERE resource LIKE ? || '%'", (OUTPUT,)).fetchall()
+            for key, other_run, other_node in held:
+                if (other_run, other_node) == (run, node):
+                    continue
+                theirs = PurePosixPath(key.removeprefix(OUTPUT))
+                for path in outputs:
+                    mine = PurePosixPath(path.casefold())
+                    if mine.is_relative_to(theirs) or theirs.is_relative_to(mine):
+                        return (f"output {path} overlaps {theirs} held by run {other_run} "
+                                f"node {other_node}")
+        return None
+
+    def conflict(self, run, node, resources, outputs=()) -> str | None:
+        """Why ``node`` of ``run`` cannot hold these resources and output paths now, or None."""
+        with self._transaction() as db:
+            return self._conflict(db, run, node, resources, outputs)
+
+    def reserve(self, run, node, resources, outputs=()):
+        """Hold every resource and output path for ``node`` of ``run``, or none of them.
 
         A resource the same node already holds stays held; one held by any other node refuses.
+        Output paths compare without case, and a path inside or around a held one refuses.
         """
         with self._transaction() as db:
-            for resource in resources:
-                row = db.execute("SELECT run, node FROM reservations WHERE resource = ?",
-                                 (resource,)).fetchone()
-                if row is not None and tuple(row) != (run, node):
-                    raise ValueError(f"{resource} is held by run {row[0]} node {row[1]}")
-            for resource in resources:
+            reason = self._conflict(db, run, node, resources, outputs)
+            if reason:
+                raise ValueError(reason)
+            for resource in [*resources, *(OUTPUT + path.casefold() for path in outputs)]:
                 db.execute("INSERT OR IGNORE INTO reservations VALUES (?, ?, ?, ?)",
                            (resource, run, node, time.time()))
 
