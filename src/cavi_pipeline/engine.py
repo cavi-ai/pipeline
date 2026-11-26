@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 # Two supersteps per step that finishes in one event, and the schedule and wait around them.
 RECURSION_LIMIT = 4 * MAX_NODES + 8
+_CURRENT_REVISION = object()
 
 
 def _merge(left: dict, right: dict) -> dict:
@@ -179,8 +180,8 @@ class Engine:
             raise ValueError(f"Run {run} has no state in this store")
         return snapshot
 
-    def _apply(self, run, revision, decide):
-        """Resume ``run`` with the event ``decide`` returns; revision None takes the current one."""
+    def _apply(self, run, revision, decide, *, max_events=1):
+        """Apply events under the run lock, checking the revision before the first write."""
         self.registry.run(run)
         with self._lock(run):
             snapshot = self._snapshot(run)
@@ -189,18 +190,24 @@ class Engine:
                 snapshot = self._snapshot(run)
             values = snapshot.values
             current = snapshot.config["configurable"]["checkpoint_id"]
-            if revision is not None and revision != current:
+            if revision is not _CURRENT_REVISION and revision != current:
                 raise ValueError(f"Revision {revision} is not the current revision {current}; "
                                  "read workflow_status and act on what it shows")
             if values["cancelled"]:
                 raise ValueError(f"Run {run} is cancelled")
             graph, run_dir = self._graph(values), Path(values["run_dir"])
-            resets = {node_id: _entry(attempt=values["nodes"][node_id]["attempt"],
-                                      reason=f"stale: {why}")
-                      for node_id, why in ledger.stale(graph, values["nodes"], run_dir).items()}
-            event = decide(graph, run_dir, {**values["nodes"], **resets})
-            event["nodes"] = {**resets, **event.get("nodes", {})}
-            if event["nodes"] or event.get("cancelled"):
+            for index in range(max_events):
+                if index:
+                    values = self._snapshot(run).values
+                nodes = values["nodes"]
+                resets = {node_id: _entry(attempt=nodes[node_id]["attempt"], reason=f"stale: {why}")
+                          for node_id, why in ledger.stale(graph, nodes, run_dir).items()}
+                event = decide(graph, run_dir, {**nodes, **resets})
+                # After the initial event, continue only for new work the caller requested.
+                # Otherwise a step that invalidates its own prerequisites could run repeatedly.
+                if not (event.get("nodes") or event.get("cancelled") or (index == 0 and resets)):
+                    break
+                event["nodes"] = {**resets, **event.get("nodes", {})}
                 self._invoke(Command(resume=event), run)
             return self._status(run)
 
@@ -255,53 +262,83 @@ class Engine:
     def require(self, run, node_id) -> dict:
         """Settle every node ``node_id`` depends on and raise the first one that is not done.
 
-        An agent node whose dependencies are done and whose outputs and check pass is recorded
-        done without workflow_begin; a done node that no longer passes waits again with the
-        check's reason. Approval and step nodes keep their state. Returns the run status.
+        Eligible agents can be recorded done without workflow_begin. Running and uncertain
+        attempts keep their state. A done agent that no longer passes waits again with the
+        check's reason. Ready steps run through the scheduler. Returns the run status.
         """
         return self._settle(run, node_id, include=False)
 
     def _settle(self, run, node_id, include):
-        reasons, first = {}, []
+        wanted, checked, retried = set(), set(), set()
+        reasons = {}
 
         def decide(graph, run_dir, nodes):
             self._node(graph, node_id)
-            wanted = graph.ancestors(node_id) | ({node_id} if include else set())
+            wanted.update(graph.ancestors(node_id))
+            if include:
+                wanted.add(node_id)
             merged, update = dict(nodes), {}
             for current in graph.order():
                 spec, entry = graph.nodes[current], merged[current]
-                if (current not in wanted or spec.kind != "agent"
+                if (current not in wanted or current in checked or spec.kind != "agent"
+                        or entry["status"] in ("running", "uncertain")
                         or any(merged[name]["status"] != "done"
                                for name in spec.depends + spec.after)):
                     continue
+                checked.add(current)
                 upstream = {name: merged[name]["receipt"] for name in spec.depends}
                 try:
                     recorded = self._evidence(spec, run_dir, upstream)
                 except ValueError as exc:
-                    reasons[current] = str(exc)
-                    if entry["status"] in ("done", "waiting") and entry["reason"] != str(exc):
-                        update[current] = merged[current] = _entry(attempt=entry["attempt"],
-                                                                    reason=str(exc))
-                    continue
-                receipt = ledger.receipt(recorded)
-                if entry["status"] != "done" or entry["receipt"] != receipt:
+                    reason = reasons[current] = str(exc)
+                    if entry["status"] == "failed" or entry["reason"] == reason:
+                        continue
+                    next_entry = _entry(attempt=entry["attempt"], reason=reason)
+                else:
+                    receipt = ledger.receipt(recorded)
+                    if entry["status"] == "done" and entry["receipt"] == receipt:
+                        continue
                     self.registry.release(run, current)
-                    update[current] = merged[current] = _entry(
+                    next_entry = _entry(
                         status="done", attempt=entry["attempt"] + 1, evidence=recorded,
                         receipt=receipt)
-            pending = [name for name in graph.order()
-                       if name in wanted and merged[name]["status"] != "done"]
-            if pending:
-                name = pending[0]
-                kind = graph.nodes[name].kind
-                first.append(reasons.get(name) or (
-                    f"{name} is {merged[name]['status']}; {kind} nodes are not settled by a check"
-                    if kind != "agent" else _why_not_ready(graph, merged, name)))
+                update[current] = merged[current] = next_entry
+                if entry["status"] == "done":
+                    # The scheduler must see invalidation in the same event as this change.
+                    change = ("was recorded again" if next_entry["status"] == "done"
+                              else "is no longer done")
+                    for dependent in graph.descendants(current):
+                        if merged[dependent]["status"] == "done":
+                            update[dependent] = merged[dependent] = _entry(
+                                attempt=merged[dependent]["attempt"],
+                                reason=f"stale: {current} {change}")
+
+            if not update:
+                for current in _ready(graph, merged):
+                    entry, spec = merged[current], graph.nodes[current]
+                    if (current not in wanted or current in retried or spec.kind != "step"
+                            or not entry["blocked"]):
+                        continue
+                    if all(self.registry.holder(resource) in (None, (run, current))
+                           for resource in spec.resources):
+                        retried.add(current)
+                        update[current] = {**entry, "blocked": None}
             return {"nodes": update}
 
-        status = self._apply(run, None, decide)
-        if first:
-            raise ValueError(first[0])
+        # Steps can unblock another layer of agents on each scheduler pass.
+        status = self._apply(run, _CURRENT_REVISION, decide, max_events=MAX_NODES + 1)
+        for row in status["nodes"]:
+            name, kind, state = row["id"], row["kind"], row["status"]
+            if name not in wanted or state == "done":
+                continue
+            if name in reasons:
+                raise ValueError(reasons[name])
+            if blocked := row.get("blocked"):
+                raise ValueError(f"{name} is blocked: {blocked}")
+            if kind == "approval" and state in ("waiting", "ready"):
+                raise ValueError(f"{name} is waiting; approval nodes are not settled by a check")
+            detail = f": {row['reason']}" if row.get("reason") else ""
+            raise ValueError(f"{name} is {state}{detail}")
         return status
 
     def status(self, run) -> dict:

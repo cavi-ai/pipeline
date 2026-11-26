@@ -127,7 +127,7 @@ A server tool that writes a node's outputs itself gates on the engine instead of
 | `engine.require(run, node)` | Settle every node `node` depends on and raise the first that is not done |
 | `engine.check(run, node)` | Settle `node` and every node it depends on and raise the first that is not done |
 
-Settling records an agent node done when its dependencies are done and its outputs and check pass, and returns a done node whose check now fails to waiting with the check's message. Approval and step nodes keep their state. A call that changes nothing keeps the revision.
+Settling records an eligible agent node done when its dependencies are done and its outputs and check pass. Running and uncertain agents keep their attempts and reservations. A failed check returns a completed agent to waiting and invalidates nodes that depend on it. The scheduler runs ready steps, including previously blocked steps whose resources are now free. Approval nodes still require a decision. A call that changes nothing keeps the revision.
 
 `register(server, engine)` adds the tools when the store or runs directory is only known later: every tool call asks `engine()` for the engine, and an error it raises is the tool's error.
 
