@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 from threading import Event
 
-from cavi_pipeline import Engine, load_directory
+from cavi_pipeline import Engine, Graph, Node, load_directory
 
 FIXTURES = Path(__file__).parent / "fixtures" / "graphs"
 CHAIN = ("research", "outline", "script", "picture", "layout")
@@ -104,6 +104,14 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not the current revision"):
             self.h.engine.begin(run, "research", first["revision"])
         self.assertEqual(statuses(self.h.engine.status(run))["research"], "ready")
+
+    def test_cancel_without_a_revision_keeps_the_run_and_its_reservation(self):
+        run, view = self.h.start()
+        view = self.h.engine.begin(run, "score", view["revision"])
+        with self.assertRaisesRegex(ValueError, "not the current revision"):
+            self.h.engine.cancel(run, None, "Brief withdrawn")
+        self.assertEqual(self.h.engine.status(run), view)
+        self.assertEqual(row(view, "score")["holds"], ["gpu"])
 
     def test_status_waits_for_an_in_progress_write_to_the_same_run(self):
         run, _ = self.h.start()
@@ -233,11 +241,15 @@ class EngineTests(unittest.TestCase):
 
     def test_an_uncertain_node_keeps_its_resources_until_retried(self):
         first, view = self.h.start("one")
+        self.h.write(first, "score")
         view = self.h.engine.begin(first, "score", view["revision"])
         view = self.h.engine.fail(first, "score", view["revision"], "Render host stopped answering",
                                   uncertain=True)
         self.assertEqual(row(view, "score")["status"], "uncertain")
         self.assertEqual(row(view, "score")["holds"], ["gpu"])
+        with self.assertRaisesRegex(ValueError, "score is uncertain"):
+            self.h.engine.check(first, "score")
+        self.assertEqual(self.h.engine.status(first), view)
 
         second, other = self.h.start("two")
         with self.assertRaisesRegex(ValueError, f"gpu is held by run {first} node score"):
@@ -296,6 +308,129 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "is cancelled"):
             self.h.engine.begin(run, "research", view["revision"])
         self.assertNotEqual(self.h.engine.start("cut", "one")["run"], run)
+
+    def test_check_records_the_agent_nodes_whose_checks_pass(self):
+        run, _ = self.h.start()
+        self.h.write(run, "research")
+        self.h.write(run, "outline")
+        view = self.h.engine.check(run, "outline")
+        self.assertEqual(statuses(view)["research"], "done")
+        self.assertEqual(statuses(view)["outline"], "done")
+        self.assertEqual(view["ready"], ["script", "score"])
+        self.assertEqual(self.h.engine.check(run, "outline")["revision"], view["revision"])
+
+        self.h.write(run, "research", '{"claims": []}')
+        with self.assertRaisesRegex(ValueError, "needs at least one claim"):
+            self.h.engine.check(run, "outline")
+        view = self.h.engine.status(run)
+        self.assertEqual(row(view, "research")["status"], "ready")
+        self.assertEqual(row(view, "research")["reason"], "research.json needs at least one claim")
+        self.assertEqual(row(view, "outline")["status"], "waiting")
+
+    def test_require_settles_only_the_dependencies(self):
+        run, _ = self.h.start()
+        with self.assertRaisesRegex(ValueError, "output research.json does not exist"):
+            self.h.engine.require(run, "outline")
+        refused = self.h.engine.status(run)
+        with self.assertRaisesRegex(ValueError, "output research.json does not exist"):
+            self.h.engine.require(run, "outline")
+        self.assertEqual(self.h.engine.status(run)["revision"], refused["revision"])
+        self.h.write(run, "research")
+        self.h.write(run, "outline")
+        view = self.h.engine.require(run, "outline")
+        self.assertEqual(statuses(view)["research"], "done")
+        self.assertEqual(statuses(view)["outline"], "ready")
+
+    def test_settled_agent_nodes_start_steps_and_leave_approvals_to_the_reviewer(self):
+        run, _ = self.h.start()
+        for node_id in (*CHAIN, "score"):
+            self.h.write(run, node_id)
+        self.h.engine.check(run, "layout")
+        view = self.h.engine.check(run, "score")
+        self.assertEqual(statuses(view)["assemble"], "done")
+        self.assertEqual(self.h.output(run, "assemble").read_bytes(), b'frames:"layout""score"')
+        with self.assertRaisesRegex(ValueError, "review is waiting; approval nodes are not"):
+            self.h.engine.require(run, "publish")
+        self.assertTrue(self.h.approve(run)["complete"])
+
+    def test_check_preserves_a_running_attempt_with_outputs(self):
+        run, view = self.h.start()
+        self.h.write(run, "score")
+        view = self.h.engine.begin(run, "score", view["revision"])
+        other, other_view = self.h.start("two")
+        with self.assertRaisesRegex(ValueError, "score is running"):
+            self.h.engine.check(run, "score")
+        self.assertEqual(self.h.engine.status(run), view)
+        with self.assertRaisesRegex(ValueError, f"gpu is held by run {run} node score"):
+            self.h.engine.begin(other, "score", other_view["revision"])
+
+    def test_failed_revalidation_invalidates_completed_dependents_before_steps_run(self):
+        run, _ = self.h.start()
+        for node_id in CHAIN:
+            self.h.finish(run, node_id)
+        self.assertEqual(statuses(self.h.engine.status(run))["render"], "done")
+        self.h.write(run, "score")
+        policy = self.h.output(run, "research").with_name("policy.txt")
+        policy.write_text("closed")
+
+        def check_policy(run_dir):
+            if (run_dir / "policy.txt").read_text() == "closed":
+                raise ValueError("Research policy changed")
+
+        self.h.engine.hooks["cites_sources"] = check_policy
+        with self.assertRaisesRegex(ValueError, "Research policy changed"):
+            self.h.engine.require(run, "review")
+        self.assertFalse(self.h.output(run, "assemble").exists())
+        view = self.h.engine.status(run)
+        self.assertEqual(statuses(view)["score"], "done")
+        for node_id in (*CHAIN[1:], "render", "assemble"):
+            self.assertEqual(statuses(view)[node_id], "waiting", node_id)
+
+    def test_check_succeeds_when_settling_an_agent_runs_the_requested_step(self):
+        run, _ = self.h.start()
+        for node_id in CHAIN:
+            self.h.write(run, node_id)
+        view = self.h.engine.check(run, "render")
+        self.assertEqual(statuses(view)["render"], "done")
+        self.assertEqual(self.h.output(run, "render").read_bytes(), b'frames:"layout"')
+
+    def test_check_settles_an_agent_made_ready_by_a_step_in_the_same_call(self):
+        titles = Node("titles", "agent", depends=("render",),
+                      outputs=(("titles", "titles.json"),))
+        nodes = {**self.h.graphs["cut"].nodes, "titles": titles}
+        self.h.graphs["cut"] = Graph("cut", nodes)
+        self.h.reopen()
+        run, _ = self.h.start()
+        for node_id in (*CHAIN, "titles"):
+            self.h.write(run, node_id)
+        view = self.h.engine.check(run, "titles")
+        self.assertEqual(statuses(view)["render"], "done")
+        self.assertEqual(statuses(view)["titles"], "done")
+
+    def test_check_reconsiders_a_blocked_step_after_another_run_releases_its_resource(self):
+        holder, view = self.h.start()
+        view = self.h.engine.begin(holder, "score", view["revision"])
+        run, _ = self.h.start("two")
+        for node_id in CHAIN:
+            blocked = self.h.finish(run, node_id)
+        self.assertIn("blocked", row(blocked, "render"))
+        with self.assertRaisesRegex(ValueError, "render is"):
+            self.h.engine.check(run, "render")
+        self.assertEqual(self.h.engine.status(run)["revision"], blocked["revision"])
+
+        self.h.engine.cancel(holder, view["revision"], "Render cancelled")
+        done = self.h.engine.check(run, "render")
+        self.assertEqual(statuses(done)["render"], "done")
+        self.assertEqual(row(done, "render")["attempt"], 1)
+
+    def test_adopt_returns_the_live_run_of_a_directory(self):
+        run, view = self.h.start()
+        self.assertEqual(self.h.engine.adopt("cut", "one"), run)
+        self.assertEqual(self.h.engine.adopt("cut", str(self.h.runs.resolve() / "one")), run)
+        self.h.engine.cancel(run, view["revision"], "Brief withdrawn")
+        fresh = self.h.engine.adopt("cut", "one")
+        self.assertNotEqual(fresh, run)
+        self.assertEqual(self.h.engine.status(fresh)["ready"], ["research", "score"])
 
     def test_refuses_run_directories_outside_the_runs_workspace(self):
         for value in ("../outside", "/etc", "missing"):

@@ -49,6 +49,17 @@ class Graph:
         """The check and run hook names the graph needs."""
         return {name for node in self.nodes.values() for name in (node.check, node.run) if name}
 
+    def ancestors(self, node_id: str) -> set[str]:
+        """Nodes ``node_id`` depends on or runs after, directly or through other nodes."""
+        found, pending = set(), [node_id]
+        while pending:
+            node = self.nodes[pending.pop()]
+            for name in node.depends + node.after:
+                if name not in found:
+                    found.add(name)
+                    pending.append(name)
+        return found
+
     def descendants(self, node_id: str) -> set[str]:
         """Nodes that depend on ``node_id``, directly or through other dependencies."""
         found, pending = set(), [node_id]

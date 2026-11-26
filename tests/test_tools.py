@@ -7,7 +7,7 @@ from pathlib import Path
 from cavi_mcp_core.server import Server
 from mcp import Client
 
-from cavi_pipeline import mount
+from cavi_pipeline import mount, register
 
 FIXTURES = Path(__file__).parent / "fixtures" / "graphs"
 
@@ -71,6 +71,18 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(refused.is_error)
         self.assertIn("not the current revision", refused.content[0].text)
         self.assertTrue(unknown.is_error)
+
+    def test_register_asks_for_the_engine_on_each_call(self):
+        server = Server("later", version="1")
+
+        def engine():
+            raise ValueError("Configure the runs workspace first")
+
+        register(server, engine)
+        tools, refused = asyncio.run(session(server, [("workflow_list", {})]))
+        self.assertIn("workflow_status", {tool.name for tool in tools})
+        self.assertTrue(refused.is_error)
+        self.assertIn("Configure the runs workspace first", refused.content[0].text)
 
 
 if __name__ == "__main__":

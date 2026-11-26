@@ -64,6 +64,14 @@ class Registry:
             raise ValueError(f"Unknown run {run}")
         return dict(zip(("run", "graph", "run_dir", "state", "created"), row, strict=True))
 
+    def live(self, run_dir) -> dict | None:
+        """The live run in ``run_dir``, or None."""
+        with self._transaction() as db:
+            row = db.execute("SELECT run, graph, run_dir, state, created FROM runs "
+                             "WHERE run_dir = ? AND state = 'live'", (run_dir,)).fetchone()
+        return None if row is None else dict(
+            zip(("run", "graph", "run_dir", "state", "created"), row, strict=True))
+
     def runs(self) -> list[dict]:
         with self._transaction() as db:
             rows = db.execute("SELECT run, graph, run_dir, state, created FROM runs "
